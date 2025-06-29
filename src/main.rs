@@ -1,26 +1,31 @@
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
+    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
+    Terminal,
 };
+use std::io::Stdout;
+
+mod modules;
 
 enum InputMode {
     Normal,
     Editing,
 }
 
-struct App {
+struct MainMenu {
     input: String,
     cursor_position: usize,
     input_mode: InputMode,
     selected: usize,
 }
 
-impl App {
-    fn new() -> App {
-        App {
+impl MainMenu {
+    fn new() -> MainMenu {
+        MainMenu {
             input: String::new(),
             cursor_position: 0,
             input_mode: InputMode::Normal,
@@ -41,6 +46,7 @@ impl App {
     fn enter_char(&mut self, new_char: char) {
         self.input.insert(self.cursor_position, new_char);
         self.move_cursor_right();
+        self.selected = 0;
     }
 
     fn delete_char(&mut self) {
@@ -52,6 +58,7 @@ impl App {
             let after_char_to_delete = self.input.chars().skip(current_index);
             self.input = before_char_to_delete.chain(after_char_to_delete).collect();
             self.move_cursor_left();
+            self.selected = 0;
         }
     }
 
@@ -59,16 +66,16 @@ impl App {
         new_cursor_pos.clamp(0, self.input.len())
     }
 
-    fn next_todo(&mut self, todos_len: usize) {
-        if todos_len > 0 {
-            self.selected = (self.selected + 1) % todos_len;
+    fn next_item(&mut self, items_len: usize) {
+        if items_len > 0 {
+            self.selected = (self.selected + 1) % items_len;
         }
     }
 
-    fn previous_todo(&mut self, todos_len: usize) {
-        if todos_len > 0 {
+    fn previous_item(&mut self, items_len: usize) {
+        if items_len > 0 {
             self.selected = if self.selected == 0 {
-                todos_len - 1
+                items_len - 1
             } else {
                 self.selected - 1
             };
@@ -79,137 +86,178 @@ impl App {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let mut terminal = ratatui::init();
-    let app_result = run(&mut terminal);
+    let app_result = run_main_menu(&mut terminal);
     ratatui::restore();
     app_result
 }
 
-fn run(terminal: &mut Terminal<impl Backend>) -> Result<()> {
-    let mut app = App::new();
+fn run_main_menu(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    let mut menu = MainMenu::new();
+    let all_programs = vec![
+        ("JSON Utils", "JSON viewer, formatter, and validator"),
+        ("Base64 Tools", "Base64 encode/decode utilities"),
+        ("String Utils", "String manipulation tools"),
+        ("File Tools", "File operations and utilities"),
+    ];
 
     loop {
-        let all_todos = vec![
-            "Todo 1: Learn Rust",
-            "Todo 2: Build terminal app",
-            "Todo 3: Master ratatui",
-            "Todo 4: Create awesome UI",
-            "Todo 5: Debug performance issues",
-            "Todo 6: Write documentation",
-        ];
-
         terminal.draw(|frame| {
             let area = frame.area();
-
+            
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                ])
                 .split(area);
 
-            let input_title = match app.input_mode {
-                InputMode::Normal => "Input (Press 'i' to edit)",
-                InputMode::Editing => "Input (Press 'Esc' to exit editing)",
+            let title = Paragraph::new("🚀 Dev Tools Menu")
+                .block(Block::default().borders(Borders::ALL))
+                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                .alignment(Alignment::Center);
+            frame.render_widget(title, chunks[0]);
+
+            let input_title = match menu.input_mode {
+                InputMode::Normal => "Filter Programs (Press 'i' to search, 'q' to quit)",
+                InputMode::Editing => "Filter Programs (Press 'Esc' to stop searching)",
             };
             let input_block = Block::default().title(input_title).borders(Borders::ALL);
-            let input_paragraph =
-                Paragraph::new(app.input.as_str())
-                    .block(input_block)
-                    .style(match app.input_mode {
-                        InputMode::Normal => Style::default().fg(Color::Gray),
-                        InputMode::Editing => Style::default().fg(Color::Yellow),
-                    });
-            frame.render_widget(input_paragraph, chunks[0]);
+            let input_paragraph = Paragraph::new(menu.input.as_str())
+                .block(input_block)
+                .style(match menu.input_mode {
+                    InputMode::Normal => Style::default().fg(Color::Gray),
+                    InputMode::Editing => Style::default().fg(Color::Yellow),
+                });
+            frame.render_widget(input_paragraph, chunks[1]);
 
-            if matches!(app.input_mode, InputMode::Editing) {
+            if matches!(menu.input_mode, InputMode::Editing) {
                 frame.set_cursor_position((
-                    chunks[0].x + app.cursor_position as u16 + 1,
-                    chunks[0].y + 1,
+                    chunks[1].x + menu.cursor_position as u16 + 1,
+                    chunks[1].y + 1,
                 ));
             }
 
-            let filtered_todos: Vec<ListItem> = all_todos
+            let filtered_programs: Vec<(&str, &str)> = all_programs
                 .iter()
-                .filter(|todo| {
-                    if app.input.is_empty() {
+                .filter(|(name, _desc)| {
+                    if menu.input.is_empty() {
                         true
                     } else {
-                        todo.to_lowercase().contains(&app.input.to_lowercase())
+                        name.to_lowercase().contains(&menu.input.to_lowercase())
                     }
                 })
-                .map(|todo| ListItem::new(*todo))
+                .copied()
                 .collect();
 
-            let filtered_count = filtered_todos.len();
-            let todo_list = List::new(filtered_todos)
+            let program_list: Vec<ListItem> = filtered_programs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, desc))| {
+                    let style = if i == menu.selected {
+                        Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(format!("{} - {}", name, desc)).style(style)
+                })
+                .collect();
+
+            let program_menu = List::new(program_list)
                 .block(
                     Block::default()
-                        .title("Todos (j/k to navigate)")
-                        .borders(Borders::ALL),
-                )
-                .style(Style::default().fg(Color::White))
-                .highlight_style(
-                    Style::default()
-                        .add_modifier(Modifier::ITALIC)
-                        .bg(Color::Blue),
+                        .title("Available Programs (↑/↓ or j/k to navigate, Enter to select)")
+                        .borders(Borders::ALL)
                 )
                 .highlight_symbol(">> ");
 
-            let mut list_state = ratatui::widgets::ListState::default();
-            if filtered_count > 0 {
-                list_state.select(Some(app.selected.min(filtered_count - 1)));
-            }
-            frame.render_stateful_widget(todo_list, chunks[1], &mut list_state);
+            frame.render_widget(program_menu, chunks[2]);
+
+            let help = Paragraph::new("i: search, ↑/↓ j/k: navigate, Enter: select, q: quit")
+                .block(Block::default().borders(Borders::ALL))
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center);
+            frame.render_widget(help, chunks[3]);
         })?;
 
         if let Event::Key(key) = event::read()? {
-            match app.input_mode {
+            match menu.input_mode {
                 InputMode::Normal => match key.code {
                     KeyCode::Char('q') if key.kind == KeyEventKind::Press => break,
                     KeyCode::Char('i') if key.kind == KeyEventKind::Press => {
-                        app.input_mode = InputMode::Editing;
+                        menu.input_mode = InputMode::Editing;
                     }
-                    KeyCode::Char('j') if key.kind == KeyEventKind::Press => {
-                        let filtered_count = all_todos
+                    KeyCode::Up | KeyCode::Char('k') if key.kind == KeyEventKind::Press => {
+                        let filtered_count = all_programs
                             .iter()
-                            .filter(|todo| {
-                                if app.input.is_empty() {
+                            .filter(|(name, _)| {
+                                if menu.input.is_empty() {
                                     true
                                 } else {
-                                    todo.to_lowercase().contains(&app.input.to_lowercase())
+                                    name.to_lowercase().contains(&menu.input.to_lowercase())
                                 }
                             })
                             .count();
-                        app.next_todo(filtered_count);
+                        menu.previous_item(filtered_count);
                     }
-                    KeyCode::Char('k') if key.kind == KeyEventKind::Press => {
-                        let filtered_count = all_todos
+                    KeyCode::Down | KeyCode::Char('j') if key.kind == KeyEventKind::Press => {
+                        let filtered_count = all_programs
                             .iter()
-                            .filter(|todo| {
-                                if app.input.is_empty() {
+                            .filter(|(name, _)| {
+                                if menu.input.is_empty() {
                                     true
                                 } else {
-                                    todo.to_lowercase().contains(&app.input.to_lowercase())
+                                    name.to_lowercase().contains(&menu.input.to_lowercase())
                                 }
                             })
                             .count();
-                        app.previous_todo(filtered_count);
+                        menu.next_item(filtered_count);
+                    }
+                    KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                        let filtered_programs: Vec<_> = all_programs
+                            .iter()
+                            .filter(|(name, _)| {
+                                if menu.input.is_empty() {
+                                    true
+                                } else {
+                                    name.to_lowercase().contains(&menu.input.to_lowercase())
+                                }
+                            })
+                            .collect();
+                        
+                        if menu.selected < filtered_programs.len() {
+                            let selected_program = filtered_programs[menu.selected].0;
+                            match selected_program {
+                                "JSON Utils" => {
+                                    ratatui::restore();
+                                    modules::json_utils::run_json_utils()?;
+                                    *terminal = ratatui::init();
+                                }
+                                _ => {
+                                    // TODO: Implement other programs
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 },
                 InputMode::Editing => match key.code {
                     KeyCode::Esc if key.kind == KeyEventKind::Press => {
-                        app.input_mode = InputMode::Normal;
+                        menu.input_mode = InputMode::Normal;
                     }
                     KeyCode::Char(c) if key.kind == KeyEventKind::Press => {
-                        app.enter_char(c);
+                        menu.enter_char(c);
                     }
                     KeyCode::Backspace if key.kind == KeyEventKind::Press => {
-                        app.delete_char();
+                        menu.delete_char();
                     }
                     KeyCode::Left if key.kind == KeyEventKind::Press => {
-                        app.move_cursor_left();
+                        menu.move_cursor_left();
                     }
                     KeyCode::Right if key.kind == KeyEventKind::Press => {
-                        app.move_cursor_right();
+                        menu.move_cursor_right();
                     }
                     _ => {}
                 },
@@ -218,3 +266,4 @@ fn run(terminal: &mut Terminal<impl Backend>) -> Result<()> {
     }
     Ok(())
 }
+
