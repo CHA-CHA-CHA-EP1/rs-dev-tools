@@ -1,12 +1,17 @@
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use serde_json::{self, Value};
 use arboard::Clipboard;
+use std::fs;
+use std::process::Command;
+use tempfile::NamedTempFile;
+use notify::{Watcher, RecursiveMode, Result as NotifyResult};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(PartialEq)]
 enum ViewMode {
@@ -33,6 +38,10 @@ pub struct JsonUtils {
     json_tree: Vec<JsonTreeNode>,
     selected_node: usize,
     parsed_value: Option<Value>,
+    temp_file: Option<NamedTempFile>,
+    file_watcher_rx: Option<mpsc::Receiver<NotifyResult<notify::Event>>>,
+    needs_terminal_reinit: bool,
+    scroll_offset: usize,
 }
 
 impl JsonUtils {
@@ -46,6 +55,10 @@ impl JsonUtils {
             json_tree: Vec::new(),
             selected_node: 0,
             parsed_value: None,
+            temp_file: None,
+            file_watcher_rx: None,
+            needs_terminal_reinit: false,
+            scroll_offset: 0,
         }
     }
 
@@ -70,10 +83,112 @@ impl JsonUtils {
             let mut clipboard = Clipboard::new()?;
             match clipboard.set_text(&self.formatted_json) {
                 Ok(_) => {
-                    // Success - could add a status message if needed
+                    self.error_message = "Copied formatted JSON to clipboard".to_string();
                 }
                 Err(e) => {
                     self.error_message = format!("Failed to copy to clipboard: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn copy_minified_to_clipboard(&mut self) -> Result<()> {
+        if self.is_valid {
+            if let Some(ref value) = self.parsed_value {
+                match serde_json::to_string(value) {
+                    Ok(minified) => {
+                        let mut clipboard = Clipboard::new()?;
+                        match clipboard.set_text(&minified) {
+                            Ok(_) => {
+                                self.error_message = "Copied minified JSON to clipboard".to_string();
+                            }
+                            Err(e) => {
+                                self.error_message = format!("Failed to copy to clipboard: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.error_message = format!("Failed to minify JSON: {}", e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn create_temp_file_for_editing(&mut self) -> Result<()> {
+        if self.raw_input.is_empty() {
+            self.error_message = "No JSON content to edit".to_string();
+            return Ok(());
+        }
+
+        let temp_file = NamedTempFile::new()?;
+        fs::write(temp_file.path(), &self.raw_input)?;
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(tx)?;
+        watcher.watch(temp_file.path(), RecursiveMode::NonRecursive)?;
+
+        self.error_message = format!("Edit this file: {}\nFile is being watched for changes...", temp_file.path().display());
+        
+        self.temp_file = Some(temp_file);
+        self.file_watcher_rx = Some(rx);
+        
+        Ok(())
+    }
+
+    pub fn open_in_neovim(&mut self) -> Result<()> {
+        if self.raw_input.is_empty() {
+            self.error_message = "No JSON content to edit".to_string();
+            return Ok(());
+        }
+
+        let temp_file = NamedTempFile::new()?;
+        fs::write(temp_file.path(), &self.raw_input)?;
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(tx)?;
+        watcher.watch(temp_file.path(), RecursiveMode::NonRecursive)?;
+
+        ratatui::restore();
+        
+        let status = Command::new("nvim")
+            .arg(temp_file.path())
+            .status()?;
+
+        if !status.success() {
+            self.error_message = "Failed to open Neovim".to_string();
+        }
+
+        let updated_content = fs::read_to_string(temp_file.path())?;
+        if updated_content != self.raw_input {
+            self.raw_input = updated_content;
+            self.parse_json();
+        }
+
+        self.temp_file = Some(temp_file);
+        self.file_watcher_rx = Some(rx);
+        self.needs_terminal_reinit = true;
+        
+        Ok(())
+    }
+
+    pub fn check_file_changes(&mut self) -> Result<()> {
+        if let Some(ref rx) = self.file_watcher_rx {
+            if let Ok(_event) = rx.try_recv() {
+                if let Some(ref temp_file) = self.temp_file {
+                    match fs::read_to_string(temp_file.path()) {
+                        Ok(content) => {
+                            if content != self.raw_input {
+                                self.raw_input = content;
+                                self.parse_json();
+                            }
+                        }
+                        Err(e) => {
+                            self.error_message = format!("Failed to read file: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -90,6 +205,7 @@ impl JsonUtils {
                         self.error_message.clear();
                         self.parsed_value = Some(value.clone());
                         self.build_tree(&value);
+                        self.scroll_offset = 0;
                     }
                     Err(e) => {
                         self.error_message = format!("Format error: {}", e);
@@ -183,35 +299,22 @@ impl JsonUtils {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-
-        let raw_title = "Raw Input (Press 'p' to paste from clipboard)";
-        let raw_block = Block::default()
-            .title(raw_title)
-            .borders(Borders::ALL);
-        let raw_paragraph = Paragraph::new(self.raw_input.as_str())
-            .block(raw_block)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Gray));
-        frame.render_widget(raw_paragraph, chunks[0]);
-
-        // Right panel - either raw or tree view
+        // Full screen - either raw or tree view
         match self.view_mode {
-            ViewMode::Raw => self.render_raw_preview(frame, chunks[1]),
-            ViewMode::Tree => self.render_tree_view(frame, chunks[1]),
+            ViewMode::Raw => self.render_raw_preview(frame, area),
+            ViewMode::Tree => self.render_tree_view(frame, area),
         }
     }
 
     fn render_raw_preview(&self, frame: &mut Frame, area: Rect) {
         let preview_title = if self.is_valid {
-            "JSON Preview (Press 't' to toggle tree view, 'c' to copy)"
+            "JSON Viewer - 'p': paste, 'n': neovim, 't': tree, 'c': copy, 'C': copy minified, 'j/k': scroll, 'q': quit"
+        } else if !self.error_message.is_empty() && self.error_message.contains("Edit this file:") {
+            "File Created - 'p': paste, 'n': neovim, 't': tree view, 'q': quit"
         } else if !self.error_message.is_empty() {
-            "Error"
+            "JSON Viewer - 'p': paste, 'n': neovim, 't': tree view, 'q': quit"
         } else {
-            "JSON Preview (Paste JSON to see preview)"
+            "JSON Viewer - 'p': paste, 'n': neovim, 't': tree view, 'q': quit"
         };
 
         let preview_block = Block::default()
@@ -223,26 +326,29 @@ impl JsonUtils {
         } else if !self.error_message.is_empty() {
             &self.error_message
         } else {
-            "No JSON data"
+            "Press 'p' to paste JSON from clipboard or 'n' to create new JSON in Neovim"
         };
 
         let preview_color = if self.is_valid {
             Color::Green
+        } else if !self.error_message.is_empty() && self.error_message.contains("Edit this file:") {
+            Color::Yellow
         } else if !self.error_message.is_empty() {
             Color::Red
         } else {
-            Color::Gray
+            Color::Cyan
         };
 
         let preview_paragraph = Paragraph::new(preview_content)
             .block(preview_block)
             .wrap(Wrap { trim: false })
+            .scroll((self.scroll_offset as u16, 0))
             .style(Style::default().fg(preview_color));
         frame.render_widget(preview_paragraph, area);
     }
 
     fn render_tree_view(&self, frame: &mut Frame, area: Rect) {
-        let tree_title = "JSON Tree (Press 't' to toggle raw view, 'c' to copy, Space to expand/collapse, ↑/↓ or j/k to navigate)";
+        let tree_title = "JSON Tree - 'p': paste, 'n': neovim, 't': raw, 'c': copy, 'C': copy minified, Space: expand, ↑/↓ j/k: navigate, 'q': quit";
         let tree_block = Block::default()
             .title(tree_title)
             .borders(Borders::ALL);
@@ -328,6 +434,12 @@ impl JsonUtils {
                 KeyCode::Char('p') if key.kind == KeyEventKind::Press => {
                     self.paste_from_clipboard()?;
                 }
+                KeyCode::Char('e') if key.kind == KeyEventKind::Press => {
+                    self.create_temp_file_for_editing()?;
+                }
+                KeyCode::Char('n') if key.kind == KeyEventKind::Press => {
+                    self.open_in_neovim()?;
+                }
                 KeyCode::Char('t') if key.kind == KeyEventKind::Press => {
                     self.view_mode = if self.view_mode == ViewMode::Tree {
                         ViewMode::Raw
@@ -335,11 +447,21 @@ impl JsonUtils {
                         ViewMode::Tree
                     };
                 }
-                KeyCode::Up | KeyCode::Char('k') if key.kind == KeyEventKind::Press && self.view_mode == ViewMode::Tree => {
-                    self.move_selection_up();
+                KeyCode::Up | KeyCode::Char('k') if key.kind == KeyEventKind::Press => {
+                    if self.view_mode == ViewMode::Tree {
+                        self.move_selection_up();
+                    } else {
+                        if self.scroll_offset > 0 {
+                            self.scroll_offset -= 1;
+                        }
+                    }
                 }
-                KeyCode::Down | KeyCode::Char('j') if key.kind == KeyEventKind::Press && self.view_mode == ViewMode::Tree => {
-                    self.move_selection_down();
+                KeyCode::Down | KeyCode::Char('j') if key.kind == KeyEventKind::Press => {
+                    if self.view_mode == ViewMode::Tree {
+                        self.move_selection_down();
+                    } else {
+                        self.scroll_offset += 1;
+                    }
                 }
                 KeyCode::Char(' ') if key.kind == KeyEventKind::Press && self.view_mode == ViewMode::Tree => {
                     self.toggle_node();
@@ -349,6 +471,9 @@ impl JsonUtils {
                 }
                 KeyCode::Char('c') if key.kind == KeyEventKind::Press => {
                     self.copy_to_clipboard()?;
+                }
+                KeyCode::Char('C') if key.kind == KeyEventKind::Press => {
+                    self.copy_minified_to_clipboard()?;
                 }
                 KeyCode::Esc if key.kind == KeyEventKind::Press => return Ok(false),
                 _ => {}
@@ -363,13 +488,22 @@ pub fn run_json_utils() -> Result<()> {
     let mut json_utils = JsonUtils::new();
 
     loop {
+        json_utils.check_file_changes()?;
+
+        if json_utils.needs_terminal_reinit {
+            terminal = ratatui::init();
+            json_utils.needs_terminal_reinit = false;
+        }
+
         terminal.draw(|frame| {
             json_utils.render(frame, frame.area());
         })?;
 
-        let event = event::read()?;
-        if !json_utils.handle_event(event)? {
-            break;
+        if event::poll(Duration::from_millis(100))? {
+            let event = event::read()?;
+            if !json_utils.handle_event(event)? {
+                break;
+            }
         }
     }
 
